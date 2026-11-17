@@ -42,7 +42,7 @@ static wstring F(const wchar_t* f, ...) {
 }
 
 // ============================================================ Result model
-enum class St { Ok, Warn, Fail, Info };
+enum class St { Ok, Fail, Info };
 
 struct Item {
     St      st;
@@ -244,7 +244,7 @@ static void CheckHardware(Items& v) {
         double gb = (double)_wtoi64(GetStr(o.Get(), L"Size").c_str()) / 1e9;
         const wchar_t* type = mt == 4 ? (bus == 17 ? L"NVMe SSD" : L"SATA SSD") : mt == 3 ? L"HDD" : L"Unknown";
         wstring health = hs == 0 ? L"Healthy" : hs == 1 ? L"Warning" : L"Unhealthy";
-        Add(v, hs == 0 ? St::Info : St::Warn, L"Disk",
+        Add(v, hs == 0 ? St::Info : St::Fail, L"Disk",
             F(L"%s | %s | %.0f GB | %s", GetStr(o.Get(), L"FriendlyName").c_str(), type, gb, health.c_str()),
             hs != 0 ? L"Check SMART values (e.g. CrystalDiskInfo). Back up your data." : L"");
     }
@@ -259,7 +259,7 @@ static void CheckHardware(Items& v) {
 
 // ============================================================ Security checks
 static void CheckSecurity(Items& v) {
-    // --- Windows Defender ---
+    // --- Antivirus: off = OK, on = FAIL ---
     bool defenderOn = false, otherAv = false;
     wstring otherNames;
     for (auto& o : g_wmi->Query(L"ROOT\\SecurityCenter2", L"SELECT displayName,productState FROM AntiVirusProduct")) {
@@ -282,15 +282,16 @@ static void CheckSecurity(Items& v) {
     if (ServiceState(L"WinDefend") != SERVICE_RUNNING) defenderOn = false;
 
     if (defenderOn)
-        Add(v, St::Ok, L"Windows Defender", L"active (real-time protection on)");
+        Add(v, St::Fail, L"Windows Defender", L"active (real-time protection on)",
+            L"Turn everything off: Windows Security > Virus & threat protection > Manage settings >\n"
+            L"          Real-time protection > Off, Tamper protection > Off (or use dControl), then restart your PC.");
     else if (otherAv)
-        Add(v, St::Warn, L"Windows Defender", L"off (other antivirus active: " + otherNames + L")",
-            L"Normal when another antivirus is installed. To use Defender, uninstall the other antivirus.");
+        Add(v, St::Fail, L"Antivirus", L"active (" + otherNames + L")",
+            L"No antivirus may be active. Uninstall or disable it: " + otherNames + L".");
     else
-        Add(v, St::Fail, L"Windows Defender", L"disabled",
-            L"Open Windows Security > Virus & threat protection and enable Real-time protection.");
+        Add(v, St::Ok, L"Antivirus", L"off (no antivirus active)");
 
-    // --- dControl (Defender Control): are its changes currently active? ---
+    // --- dControl (Defender Control): are its changes currently active? active = OK, not active = FAIL ---
     // dControl disables Defender via registry/policy values and by disabling the Defender services.
     std::vector<wstring> found;
     const wchar_t* pol = L"SOFTWARE\\Policies\\Microsoft\\Windows Defender";
@@ -319,16 +320,12 @@ static void CheckSecurity(Items& v) {
         found.push_back(L"dControl.exe running");
 
     if (found.empty())
-        Add(v, St::Ok, L"Defender Control (dControl)", L"no changes active");
-    else {
-        wstring list;
-        for (size_t i = 0; i < found.size(); ++i) list += L"\n            - " + found[i];
-        Add(v, St::Fail, L"Defender Control (dControl)", F(L"active (%zu changes found)", found.size()),
-            L"Open dControl and click \"Enable Windows Defender\", then restart your PC.\n"
-            L"          Found:" + list);
-    }
+        Add(v, St::Fail, L"Defender Control (dControl)", L"not active",
+            L"Open dControl and click \"Disable Windows Defender\", then restart your PC.");
+    else
+        Add(v, St::Ok, L"Defender Control (dControl)", L"active");
 
-    // --- Memory Integrity (HVCI) ---
+    // --- Memory Integrity (HVCI): off = OK, on = FAIL ---
     bool hvciRunning = false;
     for (auto& o : g_wmi->Query(L"ROOT\\Microsoft\\Windows\\DeviceGuard", L"SELECT * FROM Win32_DeviceGuard"))
         for (auto s : GetIntArray(o.Get(), L"SecurityServicesRunning"))
@@ -344,46 +341,46 @@ static void CheckSecurity(Items& v) {
     if (ci & 0x400) hvciRunning = true;
 
     if (hvciRunning)
-        Add(v, St::Ok, L"Memory Integrity (HVCI)", L"enabled");
+        Add(v, St::Fail, L"Memory Integrity (HVCI)", L"enabled",
+            L"Windows Security > Device security > Core isolation > Memory integrity > Off,\n"
+            L"          then restart your PC.");
     else {
         bool hvCfg = RegDword(HKEY_LOCAL_MACHINE,
             L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
             L"Enabled").value_or(0) == 1;
         if (hvCfg)
-            Add(v, St::Warn, L"Memory Integrity (HVCI)", L"configured but not running (reboot needed)",
-                L"Restart your PC. If it still won't turn on: check for incompatible drivers in\n"
-                L"          Windows Security > Device security > Core isolation.");
+            Add(v, St::Fail, L"Memory Integrity (HVCI)", L"configured but not running (reboot needed)",
+                L"Windows Security > Device security > Core isolation > Memory integrity > Off,\n"
+                L"          then restart your PC (otherwise it turns on after the next reboot).");
         else
-            Add(v, St::Fail, L"Memory Integrity (HVCI)", L"disabled",
-                L"Windows Security > Device security > Core isolation > Memory integrity > On.");
+            Add(v, St::Ok, L"Memory Integrity (HVCI)", L"disabled");
     }
 
-    // --- Vulnerable Driver Blocklist ---
+    // --- Vulnerable Driver Blocklist: off = OK, on = FAIL ---
     auto bl = RegDword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config", L"VulnerableDriverBlocklistEnable");
     if (bl.value_or(1) == 1)
-        Add(v, St::Ok, L"Vulnerable Driver Blocklist", L"enabled");
+        Add(v, St::Fail, L"Vulnerable Driver Blocklist", L"enabled",
+            L"Windows Security > Device security > Core isolation > Microsoft Vulnerable Driver Blocklist > Off.");
     else
-        Add(v, St::Fail, L"Vulnerable Driver Blocklist", L"disabled",
-            L"Windows Security > Device security > Core isolation > Microsoft Vulnerable Driver Blocklist > On.");
+        Add(v, St::Ok, L"Vulnerable Driver Blocklist", L"disabled");
 
     // --- Secure Boot ---
     auto sb = RegDword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", L"UEFISecureBootEnabled");
     if (sb && *sb == 1)
-        Add(v, St::Ok, L"Secure Boot", L"enabled");
+        Add(v, St::Fail, L"Secure Boot", L"enabled",
+            L"Turn off in BIOS/UEFI: Boot > Secure Boot > Disabled.");
     else
-        Add(v, St::Warn, L"Secure Boot", sb ? L"disabled" : L"not available (Legacy BIOS mode)",
-            L"Enable in BIOS/UEFI: Boot > Secure Boot > Enabled.");
+        Add(v, St::Ok, L"Secure Boot", sb ? L"disabled" : L"not available (Legacy BIOS mode)");
 
     // --- TPM ---
     auto tpmRows = g_wmi->Query(L"ROOT\\CIMV2\\Security\\MicrosoftTpm", L"SELECT * FROM Win32_Tpm");
     if (tpmRows.empty())
-        Add(v, St::Warn, L"TPM", L"not found or disabled",
-            L"Enable in BIOS: Intel PTT / AMD fTPM / Security Device Support.");
+        Add(v, St::Ok, L"TPM", L"not found or disabled");
     else {
         bool en = GetInt(tpmRows[0].Get(), L"IsEnabled_InitialValue").value_or(0) != 0;
         wstring spec = GetStr(tpmRows[0].Get(), L"SpecVersion");
-        Add(v, en ? St::Ok : St::Warn, L"TPM", F(L"%s | %s", spec.c_str(), en ? L"enabled" : L"disabled"),
-            en ? L"" : L"Enable in BIOS or run tpm.msc > Actions > Prepare the TPM.");
+        Add(v, en ? St::Fail : St::Ok, L"TPM", F(L"%s | %s", spec.c_str(), en ? L"enabled" : L"disabled"),
+            en ? L"Turn off in BIOS: Intel PTT / AMD fTPM / Security Device Support." : L"");
     }
 
     // --- VT-d / AMD-Vi (IOMMU) ---
@@ -404,22 +401,22 @@ static void CheckSecurity(Items& v) {
     bool isIntel = strncmp(vendor, "GenuineIntel", 12) == 0;
     const wchar_t* vtName = isIntel ? L"VT-x / VT-d (IOMMU)" : L"AMD-V / AMD-Vi (IOMMU)";
     const wchar_t* biosHint = isIntel
-        ? L"Enable in BIOS: Intel Virtualization Technology (VT-x) and VT-d."
-        : L"Enable in BIOS: SVM Mode and IOMMU.";
+        ? L"Turn off in BIOS: Intel Virtualization Technology (VT-x) and VT-d."
+        : L"Turn off in BIOS: SVM Mode and IOMMU.";
 
     if (vtx && slat)
-        Add(v, St::Ok, vtName, L"active");
+        Add(v, St::Fail, vtName, L"active", biosHint);
     else if (vtx)
-        Add(v, St::Warn, vtName, L"virtualization on, but SLAT/IOMMU missing", biosHint);
+        Add(v, St::Fail, vtName, L"virtualization on, but SLAT/IOMMU missing", biosHint);
     else
-        Add(v, St::Fail, vtName, L"disabled", biosHint);
+        Add(v, St::Ok, vtName, L"disabled");
 
     // --- UAC ---
     if (RegDword(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"EnableLUA").value_or(1) == 1)
-        Add(v, St::Ok, L"User Account Control (UAC)", L"enabled");
+        Add(v, St::Fail, L"User Account Control (UAC)", L"enabled",
+            L"Turn off: Settings > Accounts > Change User Account Control settings > set to \"Never notify\", then restart your PC.");
     else
-        Add(v, St::Fail, L"User Account Control (UAC)", L"disabled",
-            L"Settings > Accounts > Change User Account Control settings > set to at least level 2.");
+        Add(v, St::Ok, L"User Account Control (UAC)", L"disabled");
 
     // --- Firewall ---
     bool fwAll = true;
@@ -428,15 +425,15 @@ static void CheckSecurity(Items& v) {
         if (RegDword(HKEY_LOCAL_MACHINE, k.c_str(), L"EnableFirewall").value_or(1) != 1) fwAll = false;
     }
     if (fwAll)
-        Add(v, St::Ok, L"Windows Firewall", L"all profiles active");
+        Add(v, St::Fail, L"Windows Firewall", L"all profiles active",
+            L"Turn off. Run as admin: netsh advfirewall set allprofiles state off.");
     else
-        Add(v, St::Fail, L"Windows Firewall", L"one or more profiles disabled",
-            L"Run as admin: netsh advfirewall set allprofiles state on.");
+        Add(v, St::Ok, L"Windows Firewall", L"one or more profiles disabled");
 }
 
 // ============================================================ Software checks
 static void CheckSoftware(Items& v) {
-    // --- C++ Redistributable ---
+    // --- C++ Redistributable: installed = OK, not installed = FAIL ---
     struct Arch { const wchar_t* label; bool wow; const wchar_t* regKey; };
     Arch archs[] = {
         { L"x64", false, L"SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" },
@@ -456,7 +453,7 @@ static void CheckSoftware(Items& v) {
                 L"          or run: winget install Microsoft.VCRedist.2015+.x64");
     }
 
-    // --- DirectX 11 ---
+    // --- DirectX 11: installed = OK, missing = FAIL ---
     // Only checks that the runtime files exist. No D3D device is created, so the GPU driver is never touched.
     wstring sys = SysDir(false) + L"\\";
     if (FileExists(sys + L"d3d11.dll") && FileExists(sys + L"dxgi.dll"))
@@ -468,57 +465,44 @@ static void CheckSoftware(Items& v) {
 
 // ============================================================ Overlay checks
 static void CheckOverlays(Items& v) {
+    // Overlays must be disabled: disabled = OK, running/enabled = FAIL.
     struct Overlay {
         const wchar_t* name;
-        const wchar_t* exeName;
-        const wchar_t* howToDisable;
+        const wchar_t* exe1;
+        const wchar_t* exe2;
+        const wchar_t* howToFix;
     };
     Overlay overlays[] = {
-        { L"Discord Overlay", L"Discord.exe", // Discord uses its main process
-          L"Discord > Settings > Game Overlay > Enable in-game overlay > Off." },
-        { L"Xbox Game Bar", nullptr, // check via registry
-          L"Settings > Gaming > Xbox Game Bar > Off.\n"
-          L"          Also disable Game DVR in Settings > Gaming > Captures." },
-        { L"Steam Overlay", L"GameOverlayUI.exe",
-          L"Steam > Settings > In-Game > Enable the Steam Overlay while in-game > Off." },
-        { L"SteelSeries GG", L"SteelSeriesGG.exe",
-          L"SteelSeries GG > Settings > Disable overlay, or close SteelSeries GG." },
+        { L"Discord Overlay", L"Discord.exe", nullptr,
+          L"Discord > Settings > Game Overlay > set \"Enable in-game overlay\" to Off\n"
+          L"          (or close Discord completely, including the system tray)." },
+        { L"Steam Overlay", L"GameOverlayUI.exe", nullptr,
+          L"Steam > Settings > In-Game > set \"Enable the Steam Overlay while in-game\" to Off." },
+        { L"SteelSeries GG", L"SteelSeriesGG.exe", nullptr,
+          L"Close SteelSeries GG completely (system tray > Exit) or disable its overlay in its settings." },
+        { L"NVIDIA Overlay (ShadowPlay)", L"NVIDIA Share.exe", L"nvspcaps64.exe",
+          L"NVIDIA App / GeForce Experience > Settings > In-Game Overlay > Off." },
+        { L"AMD Adrenalin Overlay", L"AMDRSServ.exe", L"RadeonSoftware.exe",
+          L"AMD Software > Settings > Preferences > In-Game Overlay > Off." },
     };
 
+    // Xbox Game Bar (registry, read-only)
+    auto gb  = RegDword(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR", L"AppCaptureEnabled");
+    auto gb2 = RegDword(HKEY_CURRENT_USER, L"System\\GameConfigStore", L"GameDVR_Enabled");
+    if (gb.value_or(1) == 1 || gb2.value_or(1) == 1)
+        Add(v, St::Fail, L"Xbox Game Bar", L"enabled",
+            L"Settings > Gaming > Xbox Game Bar > Off.\n"
+            L"          Also disable Game DVR in Settings > Gaming > Captures.");
+    else
+        Add(v, St::Ok, L"Xbox Game Bar", L"disabled");
+
     for (auto& ol : overlays) {
-        if (wcscmp(ol.name, L"Xbox Game Bar") == 0) {
-            // Check via registry
-            auto gb = RegDword(HKEY_CURRENT_USER,
-                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR", L"AppCaptureEnabled");
-            auto gb2 = RegDword(HKEY_CURRENT_USER,
-                L"System\\GameConfigStore", L"GameDVR_Enabled");
-            bool enabled = gb.value_or(1) == 1 || gb2.value_or(1) == 1;
-            if (!enabled)
-                Add(v, St::Ok, ol.name, L"disabled");
-            else
-                Add(v, St::Warn, ol.name, L"enabled",  ol.howToDisable);
-        } else {
-            bool running = ol.exeName && ProcessRunning(ol.exeName);
-            if (!running)
-                Add(v, St::Ok, ol.name, L"not running");
-            else
-                Add(v, St::Warn, ol.name, L"running", ol.howToDisable);
-        }
+        bool running = ProcessRunning(ol.exe1) || (ol.exe2 && ProcessRunning(ol.exe2));
+        if (running)
+            Add(v, St::Fail, ol.name, L"running", ol.howToFix);
+        else
+            Add(v, St::Ok, ol.name, L"disabled");
     }
-
-    // NVIDIA GeForce Experience overlay
-    if (ProcessRunning(L"NVIDIA Share.exe") || ProcessRunning(L"nvspcaps64.exe"))
-        Add(v, St::Warn, L"NVIDIA Overlay (ShadowPlay)", L"running",
-            L"GeForce Experience > Settings > In-Game Overlay > Off.");
-    else
-        Add(v, St::Ok, L"NVIDIA Overlay (ShadowPlay)", L"not running");
-
-    // AMD Adrenalin overlay (ReLive)
-    if (ProcessRunning(L"AMDRSServ.exe") || ProcessRunning(L"RadeonSoftware.exe"))
-        Add(v, St::Warn, L"AMD Adrenalin Overlay", L"running",
-            L"AMD Software > Settings > Preferences > In-Game Overlay > Off.");
-    else
-        Add(v, St::Ok, L"AMD Adrenalin Overlay", L"not running");
 }
 
 // ============================================================ Printing
@@ -532,12 +516,9 @@ static void Section(const wchar_t* t) {
 
 static void Print(const Items& v) {
     for (auto& i : v) {
-        switch (i.st) {
-        case St::Ok:   Put(L"  [ OK ] ", cGreen);  break;
-        case St::Warn: Put(L"  [WARN] ", cYellow); break;
-        case St::Fail: Put(L"  [FAIL] ", cRed);    break;
-        case St::Info: Put(L"  [INFO] ", cCyan);    break;
-        }
+        if (i.st == St::Info)    Put(L"  [INFO] ", cCyan);
+        else if (i.st == St::Ok) Put(L"  [ OK ] ", cGreen);
+        else                Put(L"  [FAIL] ", cRed);
         Put(F(L"%-38s %s\n", i.name.c_str(), i.detail.c_str()));
     }
 }
@@ -545,11 +526,9 @@ static void Print(const Items& v) {
 static void PrintFixGuide(const Items& v) {
     bool any = false;
     for (auto& i : v) {
-        if (i.howToFix.empty() || i.st == St::Ok) continue;
+        if (i.howToFix.empty() || i.st != St::Fail) continue;
         if (!any) { any = true; }
-        WORD col = i.st == St::Fail ? cRed : cYellow;
-        Put(F(L"\n  "), col);
-        Put(i.st == St::Fail ? L"[FAIL] " : L"[WARN] ", col);
+        Put(L"\n  [FAIL] ", cRed);
         Put(i.name + L"\n", cWhite);
         Put(F(L"          %s\n", i.howToFix.c_str()), cGray);
     }
@@ -605,22 +584,18 @@ int wmain() {
     Section(L"Overlays");   Print(ov);
 
     // Summary
-    int ok = 0, warn = 0, fail = 0;
+    int ok = 0, fail = 0;
     for (auto* list : { &hw, &sec, &sw, &ov })
-        for (auto& i : *list) {
-            if (i.st == St::Ok) ++ok;
-            else if (i.st == St::Warn) ++warn;
-            else if (i.st == St::Fail) ++fail;
-        }
+        for (auto& i : *list)
+            if (i.st == St::Ok) ++ok; else if (i.st == St::Fail) ++fail;
 
-    Put(F(L"\n  Result: %d OK, %d warnings, %d issues.\n", ok, warn, fail),
-        fail ? cRed : warn ? cYellow : cGreen);
+    Put(F(L"\n  Result: %d OK, %d FAIL.\n", ok, fail), fail ? cRed : cGreen);
 
     // Collect all fixable items
     bool hasIssues = false;
     for (auto* list : { &sec, &sw, &ov, &hw })
         for (auto& i : *list)
-            if (!i.howToFix.empty() && i.st != St::Ok) { hasIssues = true; break; }
+            if (!i.howToFix.empty() && i.st == St::Fail) { hasIssues = true; break; }
 
     if (hasIssues) {
         Put(L"\n  Press [F] to show fix instructions, or any other key to exit.\n", cWhite);
